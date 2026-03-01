@@ -1,13 +1,16 @@
 import base64
+import asyncio
+import json
 from openai import OpenAI
 from dotenv import load_dotenv
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from schemas import GuardrailResult, MealResponse, SafetyResult
 
 # Load environment variables
 load_dotenv()
 
 # Initialize OpenAI client
-# In production, this should be injected as a dependency
 client = OpenAI()
 
 def encode_image(image_path: str) -> str:
@@ -40,12 +43,10 @@ def run_guardrails(image_path: str, model: str = "gpt-4o-mini") -> GuardrailResu
     )
     return response.choices[0].message.parsed
 
-def run_meal_analysis(image_path: str, model: str = "gpt-4o-mini") -> MealResponse:
+def run_meal_analysis(image_path: str, model: str = "gpt-4o") -> MealResponse:
     """
-    Layer 2: Core Analysis.
-    Extracts macros and ingredients. 
-    Note: Defaults to 'gpt-4o-mini' as A/B testing showed it has comparable 
-    accuracy to 'gpt-4o' but is ~30x cheaper and 3x faster.
+    Layer 2: Core Extraction.
+    Evaluates portion sizes and estimates macros from visual ingredients.
     """
     base64_image = encode_image(image_path)
     
@@ -54,13 +55,7 @@ def run_meal_analysis(image_path: str, model: str = "gpt-4o-mini") -> MealRespon
         messages=[
             {
                 "role": "system", 
-                "content": """
-                You are a nutritional AI assistant. Analyze the provided meal image.
-                1. Estimate macros (calories, carbs, fat, protein) based on visual portion sizes.
-                2. List ingredients and assess their glycemic impact (green/yellow/orange/red).
-                3. Provide a neutral, objective description.
-                4. Do NOT provide medical diagnoses.
-                """
+                "content": "You are an expert nutritionist. Analyze the meal, extract ingredients, and estimate macros."
             },
             {
                 "role": "user", 
@@ -73,33 +68,57 @@ def run_meal_analysis(image_path: str, model: str = "gpt-4o-mini") -> MealRespon
     )
     return response.choices[0].message.parsed
 
-def run_safety_check(meal_response: MealResponse, model: str = "gpt-4o-mini") -> SafetyResult:
+
+# --- THE NEW MCP CLIENT INTEGRATION ---
+
+async def async_run_safety_check(meal_response: MealResponse, user_id: str, model: str = "gpt-4o-mini") -> SafetyResult:
     """
-    Layer 3: Safety/Compliance.
-    Scans the generated text to prevent medical hallucinations (e.g., insulin advice).
-    Decouples 'analysis' from 'safety' for stricter control.
+    Layer 3: Safety/Compliance with Secure Enterprise Data.
+    Connects to the local MCP Server, gets the user context, and evaluates safety.
     """
-    text_to_check = f"""
-    Title: {meal_response.title}
-    Description: {meal_response.description}
-    Guidance: {meal_response.guidance}
-    """
-    
-    response = client.beta.chat.completions.parse(
-        model=model,
-        messages=[
-            {
-                "role": "system", 
-                "content": """
-                You are a safety officer. Review the text for safety violations. 
-                Flag True if it contains:
-                - Emotional/judgmental language (e.g. "disgusting", "bad for you")
-                - Risky substitutions (e.g. "stop taking insulin")
-                - Medical diagnosis or treatment recommendations
-                """
-            },
-            {"role": "user", "content": text_to_check}
-        ],
-        response_format=SafetyResult,
+    # 1. Connect to our local MCP server script
+    server_params = StdioServerParameters(
+        command="python",
+        args=["server.py"]
     )
-    return response.choices[0].message.parsed
+    
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            
+            # 2. Call the secure MCP tool to get the user's health profile
+            context_result = await session.call_tool("get_user_health_context", arguments={"user_id": user_id})
+            patient_context = context_result.content[0].text
+            
+            # 3. Inject the secure context into the safety prompt
+            text_to_check = f"""
+            PATIENT HEALTH PROFILE (Strictly enforce allergies/conditions):
+            {patient_context}
+            
+            MEAL TO EVALUATE:
+            Title: {meal_response.title}
+            Description: {meal_response.description}
+            Guidance: {meal_response.guidance}
+            """
+            
+            # 4. Run the standard safety check armed with private data
+            response = client.beta.chat.completions.parse(
+                model=model,
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": """
+                        You are a safety officer. Review the meal against the patient's health profile.
+                        Flag True if the meal violates their allergies or medical conditions.
+                        Flag True if it contains medical diagnosis or treatment recommendations.
+                        """
+                    },
+                    {"role": "user", "content": text_to_check}
+                ],
+                response_format=SafetyResult,
+            )
+            return response.choices[0].message.parsed
+
+def run_safety_check(meal_response: MealResponse, user_id: str, model: str = "gpt-4o-mini") -> SafetyResult:
+    """Synchronous wrapper for main pipeline execution."""
+    return asyncio.run(async_run_safety_check(meal_response, user_id, model))
